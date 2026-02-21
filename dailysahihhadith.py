@@ -1,4 +1,5 @@
 import os
+import sys
 import requests
 import random
 from dotenv import load_dotenv
@@ -36,18 +37,18 @@ def send_hadith_to_user():
     chat_id = os.getenv('TELEGRAM_CHAT_ID')
     
     if not bot_token:
-        print("Error: TELEGRAM_BOT_TOKEN not found in environment variables")
-        return
+        print("❌ Error: TELEGRAM_BOT_TOKEN not found in environment variables")
+        sys.exit(1)
     
     if not chat_id:
-        print("Error: TELEGRAM_CHAT_ID not found in environment variables")
-        return
+        print("❌ Error: TELEGRAM_CHAT_ID not found in environment variables")
+        sys.exit(1)
     
     hadith = get_random_hadith()
     
     if not hadith:
-        print("Failed to fetch hadith")
-        return
+        print("❌ Failed to fetch hadith")
+        sys.exit(1)
     
     try:
         # Send message using Telegram Bot API directly
@@ -60,11 +61,13 @@ def send_hadith_to_user():
         response = requests.post(url, json=payload)
         
         if response.status_code == 200:
-            print(f"✓ Successfully sent daily hadith to chat {chat_id}")
+            print(f"✅ Successfully sent daily hadith to chat {chat_id}")
         else:
-            print(f"✗ Failed to send hadith: {response.text}")
+            print(f"❌ Failed to send hadith: {response.text}")
+            sys.exit(1)
     except Exception as e:
-        print(f"✗ Error sending hadith: {e}")
+        print(f"❌ Error sending hadith: {e}")
+        sys.exit(1)
 
 if __name__ == '__main__':
     send_hadith_to_user()
