@@ -2,26 +2,68 @@ import os
 import sys
 import requests
 import random
+import time
 from dotenv import load_dotenv
 
 load_dotenv()
 
-# Available Sahih collections in fawazahmed0/hadith-api
+# Fallback: fawazahmed0/hadith-api via jsDelivr
 COLLECTIONS = {
     'eng-bukhari': {'name': 'Sahih Bukhari', 'books': 8},
     'eng-muslim':  {'name': 'Sahih Muslim',  'books': 56},
 }
 
-def get_random_hadith():
-    """Fetch a random hadith from fawazahmed0/hadith-api (jsDelivr CDN)"""
+def get_hadith_from_hadeethenc():
+    """Primary: HadeethEnc API — authenticated hadiths, English, no key required"""
+    url = "https://hadeethenc.com/api/v1/hadeeths/random/?language=en"
+
+    for attempt in range(1, 4):
+        try:
+            print(f"Attempt {attempt}: GET {url}")
+            response = requests.get(url, timeout=15)
+            print(f"Status: {response.status_code}")
+
+            if response.status_code != 200:
+                print(f"Error response: {response.text[:300]}")
+                time.sleep(2 ** attempt)
+                continue
+
+            data = response.json()
+            hadith_text = data.get('hadeeth', '').strip()
+            attribution = data.get('attribution', '').strip()
+            grade = data.get('grade', '').strip()
+
+            if not hadith_text:
+                print(f"Empty hadith text in response: {data}")
+                time.sleep(2 ** attempt)
+                continue
+
+            reference = attribution if attribution else "HadeethEnc"
+            grade_str = f" • {grade}" if grade else ""
+
+            return f"📖 *Daily Hadith*{grade_str}\n\n{hadith_text}\n\n_{reference}_"
+
+        except requests.exceptions.Timeout:
+            print(f"Attempt {attempt}: Timed out")
+        except requests.exceptions.ConnectionError as e:
+            print(f"Attempt {attempt}: Connection error - {e}")
+        except Exception as e:
+            print(f"Attempt {attempt}: Unexpected error - {e}")
+
+        time.sleep(2 ** attempt)
+
+    return None
+
+
+def get_hadith_from_fawazahmed():
+    """Fallback: fawazahmed0/hadith-api via jsDelivr CDN"""
     collection_key = random.choice(list(COLLECTIONS.keys()))
     collection = COLLECTIONS[collection_key]
     book_num = random.randint(1, collection['books'])
-
     url = f"https://cdn.jsdelivr.net/gh/fawazahmed0/hadith-api@1/editions/{collection_key}/{book_num}.json"
 
     try:
-        print(f"Fetching: {url}")
+        print(f"Fallback: GET {url}")
         response = requests.get(url, timeout=15)
         print(f"Status: {response.status_code}")
 
@@ -30,31 +72,39 @@ def get_random_hadith():
             return None
 
         data = response.json()
-        hadiths = data.get('hadiths', [])
+
+        # Filter out entries with empty text upfront
+        hadiths = [h for h in data.get('hadiths', []) if h.get('text', '').strip()]
 
         if not hadiths:
-            print("No hadiths found in response")
+            print("No valid hadiths found in this book")
             return None
 
         hadith = random.choice(hadiths)
         hadith_text = hadith.get('text', '').strip()
         hadith_number = hadith.get('hadithnumber', 'Unknown')
 
-        if not hadith_text:
-            print(f"Empty hadith text. Entry: {hadith}")
-            return None
-
         reference = f"{collection['name']} - Book {book_num}, Hadith {hadith_number}"
         return f"📖 *Daily Hadith* (Sahih)\n\n{hadith_text}\n\n_{reference}_"
 
     except requests.exceptions.Timeout:
-        print("Request timed out")
+        print("Fallback: Timed out")
     except requests.exceptions.ConnectionError as e:
-        print(f"Connection error: {e}")
+        print(f"Fallback: Connection error - {e}")
     except Exception as e:
-        print(f"Unexpected error: {e}")
+        print(f"Fallback: Unexpected error - {e}")
 
     return None
+
+
+def get_random_hadith():
+    """Try primary API first, fall back if needed"""
+    hadith = get_hadith_from_hadeethenc()
+    if hadith:
+        return hadith
+
+    print("⚠️ Primary API failed, switching to fallback...")
+    return get_hadith_from_fawazahmed()
 
 
 def send_hadith_to_user():
@@ -73,7 +123,7 @@ def send_hadith_to_user():
     hadith = get_random_hadith()
 
     if not hadith:
-        print("❌ Failed to fetch hadith")
+        print("❌ Failed to fetch hadith from all sources")
         sys.exit(1)
 
     try:
