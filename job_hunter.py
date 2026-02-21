@@ -9,7 +9,7 @@ import pandas as pd
 from dotenv import load_dotenv
 
 # --- 1. SETUP & SECRETS ---
-load_dotenv() # Load local .env file
+load_dotenv()
 
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
@@ -20,7 +20,6 @@ if not GEMINI_API_KEY or not TELEGRAM_BOT_TOKEN:
 
 # --- 2. TELEGRAM NOTIFICATION ---
 def send_telegram_message(message):
-    """Send message to Telegram"""
     url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
     data = urllib.parse.urlencode({
         'chat_id': TELEGRAM_CHAT_ID,
@@ -39,7 +38,6 @@ def send_telegram_message(message):
 
 # --- 3. SMART KEYWORD FILTER ---
 def keyword_prefilter(title, description):
-    # Ensure inputs are strings to prevent errors
     title_lower = str(title).lower() if title else ""
     desc_lower = str(description).lower() if description else ""
     
@@ -63,7 +61,7 @@ def keyword_prefilter(title, description):
         'sre manager', 'infrastructure manager', 'technical manager',
         'engineering lead', 'technical lead', 'team lead', 'devops lead',
         'manager, platform', 'manager, devops', 'manager, infrastructure',
-        'associate manager', 'delivery manager', 
+        'associate manager', 'delivery manager',
         'software engineering manager', 'software manager',
         'manager sw', 'sw engineering', 'manager 3', 'manager ii', 'manager iii'
     ]
@@ -95,22 +93,32 @@ def keyword_prefilter(title, description):
     
     return False, "Not relevant"
 
-# --- 4. AI FUNCTION ---
-def ask_gemini_stealth(prompt):
+# --- 4. AI FUNCTION (with retry logic) ---
+def ask_gemini_stealth(prompt, retries=3):
     url = f"https://generativelanguage.googleapis.com/v1beta/models/gemini-2.0-flash:generateContent?key={GEMINI_API_KEY}"
     headers = {'Content-Type': 'application/json'}
     data = json.dumps({"contents": [{"parts": [{"text": prompt}]}]}).encode('utf-8')
-    try:
-        req = urllib.request.Request(url, data=data, headers=headers, method='POST')
-        with urllib.request.urlopen(req) as response:
-            result = json.loads(response.read().decode())
-            return result['candidates'][0]['content']['parts'][0]['text']
-    except urllib.error.HTTPError as e:
-        print(f"   (AI Error: HTTP {e.code})", end="")
-        return "0"
-    except Exception as e:
-        print(f"   (AI Error: {e})", end="")
-        return "0"
+
+    for attempt in range(retries):
+        try:
+            req = urllib.request.Request(url, data=data, headers=headers, method='POST')
+            with urllib.request.urlopen(req) as response:
+                result = json.loads(response.read().decode())
+                return result['candidates'][0]['content']['parts'][0]['text']
+        except urllib.error.HTTPError as e:
+            if e.code == 429:
+                wait = (attempt + 1) * 30  # 30s, 60s, 90s
+                print(f"   (Rate limited, waiting {wait}s before retry {attempt + 1}/{retries})...", end="")
+                time.sleep(wait)
+            else:
+                print(f"   (AI Error: HTTP {e.code})", end="")
+                return "0"
+        except Exception as e:
+            print(f"   (AI Error: {e})", end="")
+            return "0"
+
+    print(f"   (AI Error: Failed after {retries} retries)", end="")
+    return "0"
 
 # --- 5. CONFIGURATION ---
 SEARCH_STRATEGIES = ["Engineering Manager DevOps", "Platform Engineering Manager", "Technical Lead Platform"]
@@ -133,13 +141,13 @@ AI & Automation: Generative AI Integration (ChatGPT/Claude), LLM Ops, Python, Ba
 Leadership: Engineering Management (Team of 7), Performance Reviews, Tech Hiring, Agile/Scrum Delivery, Stakeholder Management.
 
 PROFESSIONAL EXPERIENCE
-First American (India) Pvt. Ltd. | Bengaluru,  India
+First American (India) Pvt. Ltd. | Bengaluru, India
 Associate Manager – Platform Engineering & DevOps (Functionally: Engineering Manager)
 Apr 2025 – Present
 * Engineering Leadership: Manage a high-performing squad of 7 DevOps Engineers, handling hiring, performance appraisals, and career coaching. Scaled team from 5 to 7 members to support enterprise platform growth.
-* GenAI Innovation: Pioneered the “AI-First” DevOps initiative, training the team on Prompt Engineering and integrating ChatGPT/Claude to automate documentation and troubleshooting, boosting team productivity by 20%.
+* GenAI Innovation: Pioneered the "AI-First" DevOps initiative, training the team on Prompt Engineering and integrating ChatGPT/Claude to automate documentation and troubleshooting, boosting team productivity by 20%.
 * FinOps & Cost Strategy: Spearheaded multi-cloud (Azure/AWS) cost optimization for 50+ applications, achieving $200k+ in annual savings (20% reduction) through rightsizing and automated governance.
-* Platform Transformation: Directed the transition to GitOps and self-service pipelines, successfully slashing release cycles by 40% and increasing Agile sprint velocity by 18%. 
+* Platform Transformation: Directed the transition to GitOps and self-service pipelines, successfully slashing release cycles by 40% and increasing Agile sprint velocity by 18%.
 
 Technical Lead – DevOps & SRE
 Sep 2022 – Mar 2025
@@ -178,32 +186,31 @@ EDUCATION
 Master of Science (Physics), Andhra University, 2004
 """
 
+# --- 6. MAIN FUNCTION ---
 def start_hunting():
     print(f"🔌 Testing Connections...")
-    
-    # Test Gemini
+
+    # Test Gemini — warn but don't kill the pipeline on transient rate limits
     print(f"   - Gemini AI...", end="")
-    test = ask_gemini_stealth("Reply 'OK'")
-    if "OK" not in test:
-        print(f" ❌ Failed")
-        print("\n❌ FATAL: Gemini API is not working. Pipeline failed.")
-        sys.exit(1)  # Exit with error code
+    test = ask_gemini_stealth("Reply with the word OK and nothing else.")
+    if "OK" not in test.upper():
+        print(f" ⚠️ (Gemini test inconclusive, will retry per-job — continuing anyway)")
     else:
         print(" ✅")
-    
+
     # Test Telegram
     print(f"   - Telegram...", end="")
     if send_telegram_message("🤖 Job Hunter Started!"):
         print(" ✅")
     else:
-        print(" ⚠️ (Optional)")
-    
+        print(" ⚠️ (Optional — check TELEGRAM secrets)")
+
     all_jobs = []
     for location in LOCATIONS:
         for search_term in SEARCH_STRATEGIES:
             print(f"\n🕵️‍♂️ Scraping: '{search_term}' in {location}...")
             try:
-                time.sleep(2) 
+                time.sleep(2)
                 jobs = scrape_jobs(
                     site_name=TARGET_SITES,
                     search_term=search_term,
@@ -215,82 +222,96 @@ def start_hunting():
                 print(f"   Found {len(jobs)} jobs")
                 all_jobs.append(jobs)
             except Exception as e:
-                print(f"   ⚠️ Error: {e}")
+                print(f"   ⚠️ Error scraping '{search_term}' in {location}: {e}")
                 continue
-    
+
     if not all_jobs:
-        print("\n❌ No jobs found.")
+        print("\n❌ No jobs found from any source.")
         return
-    
+
     jobs = pd.concat(all_jobs, ignore_index=True)
     jobs = jobs.drop_duplicates(subset=['job_url'], keep='first')
     print(f"\n✅ Total unique jobs found: {len(jobs)}")
-    
-    # Phase 1: Filtering
+
+    # Phase 1: Keyword Filtering
+    print(f"\n🔍 PHASE 1: Keyword Filtering...")
     promising_jobs = []
     for index, job in jobs.iterrows():
         title = job.get('title', 'Unknown')
-        
-        # Safe description handling for filtering
         raw_desc = job.get('description')
         description = str(raw_desc) if raw_desc else ""
-        
+
         is_match, reason = keyword_prefilter(title, description)
-        
+
         if is_match:
             promising_jobs.append(job)
-            print(f"   ✅ {str(title)[:50]} - {reason}")
+            print(f"   ✅ {str(title)[:50]} — {reason}")
 
     if not promising_jobs:
-        print("\n❌ No promising jobs found.")
+        print("\n❌ No promising jobs after keyword filter.")
+        send_telegram_message("🤖 Job Hunter finished — no promising jobs found today.")
         return
-    
-    # Phase 2: AI Analysis
+
+    print(f"\n🎯 {len(promising_jobs)} jobs passed the keyword filter.")
+
+    # Phase 2: AI Scoring
     print(f"\n🤖 PHASE 2: AI Analysis on {len(promising_jobs)} promising jobs...")
-    
+
+    matched_count = 0
     for i, job in enumerate(promising_jobs):
-        if i >= 10: break # Limit calls
-        
+        if i >= 10:
+            break  # Cap AI calls to avoid burning quota
+
         title = job.get('title', 'Unknown')
         location = job.get('location', 'Unknown')
         apply_url = job.get('job_url', '#')
-        
-        # --- CRITICAL FIX: HANDLE NONE & FLOAT DESCRIPTIONS ---
+
         raw_desc = job.get('description')
-        description = str(raw_desc) # Convert NaN/Float/None to string "nan" or "None"
-        
-        # Check if it's truly empty or just "nan" text
+        description = str(raw_desc)
         if not raw_desc or description.lower() == 'nan':
             description = "No description available for this job."
-            
-        desc_truncated = description[:1500] 
-        
-        print(f"\n   Analyzing: {str(title)[:35]}...", end="")
-        
+
+        desc_truncated = description[:1500]
+
+        print(f"\n   [{i+1}] Analyzing: {str(title)[:40]}...", end="")
+
         prompt = f"""
-        Score match (0-100).
-        RESUME: {MY_RESUME}
-        JOB: {title} in {location}
-        DESC: {desc_truncated}
-        Output ONLY number.
+        Score how well this job matches the resume on a scale of 0 to 100.
+        Output ONLY a single integer number, nothing else.
+
+        RESUME:
+        {MY_RESUME}
+
+        JOB TITLE: {title}
+        LOCATION: {location}
+        JOB DESCRIPTION:
+        {desc_truncated}
         """
-        
+
         score_text = ask_gemini_stealth(prompt)
-        
-        # --- RATE LIMIT FIX: SLOW DOWN ---
-        # print(" (cooling down)...", end="")
-        time.sleep(10) # Increased to 10s to avoid 429 Errors
-        
+        time.sleep(30)  # Generous delay to avoid 429s during the job loop
+
         try:
             score = int(''.join(filter(str.isdigit, score_text)))
         except:
             score = 0
-        
-        print(f" {score}%")
-        
+
+        print(f" Score: {score}%")
+
         if score >= 55:
-            message = f"🎯 <b>MATCH: {score}%</b>\n\n<b>{title}</b>\n📍 {location}\n\n<a href='{apply_url}'>👉 APPLY NOW</a>"
+            matched_count += 1
+            message = (
+                f"🎯 <b>MATCH: {score}%</b>\n\n"
+                f"<b>{title}</b>\n"
+                f"📍 {location}\n\n"
+                f"<a href='{apply_url}'>👉 APPLY NOW</a>"
+            )
             send_telegram_message(message)
+
+    summary = f"🤖 Job Hunter done! Analyzed {min(len(promising_jobs), 10)} jobs. Found {matched_count} matches (≥55%)."
+    print(f"\n{summary}")
+    send_telegram_message(summary)
+
 
 if __name__ == "__main__":
     start_hunting()
