@@ -2,109 +2,57 @@ import os
 import sys
 import requests
 import random
-import time
 from dotenv import load_dotenv
 
 load_dotenv()
 
-# Fallback: fawazahmed0/hadith-api via jsDelivr
 COLLECTIONS = {
     'eng-bukhari': {'name': 'Sahih Bukhari', 'books': 8},
     'eng-muslim':  {'name': 'Sahih Muslim',  'books': 56},
 }
 
-def get_hadith_from_hadeethenc():
-    """Primary: HadeethEnc API — authenticated hadiths, English, no key required"""
-    url = "https://hadeethenc.com/api/v1/hadeeths/random/?language=en"
+def get_random_hadith(max_attempts=10):
+    """
+    Fetch a random hadith from fawazahmed0/hadith-api via jsDelivr CDN.
+    Retries with a different book if the chosen one has no valid text entries.
+    """
+    for attempt in range(1, max_attempts + 1):
+        collection_key = random.choice(list(COLLECTIONS.keys()))
+        collection = COLLECTIONS[collection_key]
+        book_num = random.randint(1, collection['books'])
+        url = f"https://cdn.jsdelivr.net/gh/fawazahmed0/hadith-api@1/editions/{collection_key}/{book_num}.json"
 
-    for attempt in range(1, 4):
         try:
             print(f"Attempt {attempt}: GET {url}")
             response = requests.get(url, timeout=15)
             print(f"Status: {response.status_code}")
 
             if response.status_code != 200:
-                print(f"Error response: {response.text[:300]}")
-                time.sleep(2 ** attempt)
+                print(f"Unexpected status, retrying...")
                 continue
 
             data = response.json()
-            hadith_text = data.get('hadeeth', '').strip()
-            attribution = data.get('attribution', '').strip()
-            grade = data.get('grade', '').strip()
+            hadiths = [h for h in data.get('hadiths', []) if h.get('text', '').strip()]
 
-            if not hadith_text:
-                print(f"Empty hadith text in response: {data}")
-                time.sleep(2 ** attempt)
+            if not hadiths:
+                print(f"No valid hadiths in {collection['name']} book {book_num}, retrying...")
                 continue
 
-            reference = attribution if attribution else "HadeethEnc"
-            grade_str = f" • {grade}" if grade else ""
+            hadith = random.choice(hadiths)
+            hadith_text = hadith.get('text', '').strip()
+            hadith_number = hadith.get('hadithnumber', 'Unknown')
 
-            return f"📖 *Daily Hadith*{grade_str}\n\n{hadith_text}\n\n_{reference}_"
+            reference = f"{collection['name']} - Book {book_num}, Hadith {hadith_number}"
+            return f"📖 *Daily Hadith* (Sahih)\n\n{hadith_text}\n\n_{reference}_"
 
         except requests.exceptions.Timeout:
-            print(f"Attempt {attempt}: Timed out")
+            print(f"Attempt {attempt}: Timed out, retrying...")
         except requests.exceptions.ConnectionError as e:
             print(f"Attempt {attempt}: Connection error - {e}")
         except Exception as e:
             print(f"Attempt {attempt}: Unexpected error - {e}")
 
-        time.sleep(2 ** attempt)
-
     return None
-
-
-def get_hadith_from_fawazahmed():
-    """Fallback: fawazahmed0/hadith-api via jsDelivr CDN"""
-    collection_key = random.choice(list(COLLECTIONS.keys()))
-    collection = COLLECTIONS[collection_key]
-    book_num = random.randint(1, collection['books'])
-    url = f"https://cdn.jsdelivr.net/gh/fawazahmed0/hadith-api@1/editions/{collection_key}/{book_num}.json"
-
-    try:
-        print(f"Fallback: GET {url}")
-        response = requests.get(url, timeout=15)
-        print(f"Status: {response.status_code}")
-
-        if response.status_code != 200:
-            print(f"Error response: {response.text[:300]}")
-            return None
-
-        data = response.json()
-
-        # Filter out entries with empty text upfront
-        hadiths = [h for h in data.get('hadiths', []) if h.get('text', '').strip()]
-
-        if not hadiths:
-            print("No valid hadiths found in this book")
-            return None
-
-        hadith = random.choice(hadiths)
-        hadith_text = hadith.get('text', '').strip()
-        hadith_number = hadith.get('hadithnumber', 'Unknown')
-
-        reference = f"{collection['name']} - Book {book_num}, Hadith {hadith_number}"
-        return f"📖 *Daily Hadith* (Sahih)\n\n{hadith_text}\n\n_{reference}_"
-
-    except requests.exceptions.Timeout:
-        print("Fallback: Timed out")
-    except requests.exceptions.ConnectionError as e:
-        print(f"Fallback: Connection error - {e}")
-    except Exception as e:
-        print(f"Fallback: Unexpected error - {e}")
-
-    return None
-
-
-def get_random_hadith():
-    """Try primary API first, fall back if needed"""
-    hadith = get_hadith_from_hadeethenc()
-    if hadith:
-        return hadith
-
-    print("⚠️ Primary API failed, switching to fallback...")
-    return get_hadith_from_fawazahmed()
 
 
 def send_hadith_to_user():
@@ -123,7 +71,7 @@ def send_hadith_to_user():
     hadith = get_random_hadith()
 
     if not hadith:
-        print("❌ Failed to fetch hadith from all sources")
+        print("❌ Failed to fetch hadith after all attempts")
         sys.exit(1)
 
     try:
