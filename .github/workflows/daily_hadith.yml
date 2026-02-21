@@ -1,6 +1,10 @@
 name: Daily Sahih Hadith
 
 on:
+  push:
+    branches:
+      - main
+      - develop
   schedule:
     # Runs every day at 2:30 AM UTC (8:00 AM India Time - IST)
     - cron: '30 2 * * *'

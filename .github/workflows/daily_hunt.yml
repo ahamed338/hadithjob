@@ -1,6 +1,10 @@
 name: Daily Job Hunter
 
 on:
+  push:
+    branches:
+      - main
+      - develop
   schedule:
     # Runs every day at 9 AM IST (3:30 AM UTC)
     - cron: '30 3 * * *'
