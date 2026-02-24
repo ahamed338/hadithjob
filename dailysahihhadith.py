@@ -11,6 +11,9 @@ COLLECTIONS = {
     'eng-muslim':  {'name': 'Sahih Muslim',  'books': 56},
 }
 
+MAX_BODY_LENGTH = 3800  # leaves room for formatting + reference line
+
+
 def get_random_hadith(max_attempts=10):
     """
     Fetch a random hadith from fawazahmed0/hadith-api via jsDelivr CDN.
@@ -41,8 +44,12 @@ def get_random_hadith(max_attempts=10):
             hadith = random.choice(hadiths)
             hadith_text = hadith.get('text', '').strip()
             hadith_number = hadith.get('hadithnumber', 'Unknown')
-
             reference = f"{collection['name']} - Book {book_num}, Hadith {hadith_number}"
+
+            # Truncate long hadiths at a word boundary to stay within Telegram's limit
+            if len(hadith_text) > MAX_BODY_LENGTH:
+                hadith_text = hadith_text[:MAX_BODY_LENGTH].rsplit(' ', 1)[0] + "..."
+
             return f"📖 *Daily Hadith* (Sahih)\n\n{hadith_text}\n\n_{reference}_"
 
         except requests.exceptions.Timeout:
@@ -69,7 +76,6 @@ def send_hadith_to_user():
         sys.exit(1)
 
     hadith = get_random_hadith()
-
     if not hadith:
         print("❌ Failed to fetch hadith after all attempts")
         sys.exit(1)
