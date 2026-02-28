@@ -1,25 +1,133 @@
 import os
+import re
 import sys
 import json
+import csv
 import urllib.request
 import urllib.parse
 import time
+import datetime
+from pathlib import Path
 from jobspy import scrape_jobs
 import pandas as pd
 from dotenv import load_dotenv
 
-# --- 1. SETUP & SECRETS ---
+# ─────────────────────────────────────────────
+# 1. SETUP & SECRETS
+# ─────────────────────────────────────────────
 load_dotenv()
 
-GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
-TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
-TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
+GEMINI_API_KEY      = os.getenv("GEMINI_API_KEY")
+TELEGRAM_BOT_TOKEN  = os.getenv("TELEGRAM_BOT_TOKEN")
+TELEGRAM_CHAT_ID    = os.getenv("TELEGRAM_CHAT_ID")
+
+# Resume loaded from env (recommended) or falls back to MY_RESUME below
+RESUME_TEXT = os.getenv("MY_RESUME", None)
 
 if not GEMINI_API_KEY or not TELEGRAM_BOT_TOKEN:
-    raise ValueError("Missing API Keys! Check your .env file (local) or GitHub Secrets.")
+    raise ValueError("Missing API Keys! Set GEMINI_API_KEY and TELEGRAM_BOT_TOKEN in .env or GitHub Secrets.")
 
-# --- 2. TELEGRAM NOTIFICATION ---
-def send_telegram_message(message):
+# ─────────────────────────────────────────────
+# 2. CONFIGURATION  (tweak here, not in code)
+# ─────────────────────────────────────────────
+SEARCH_STRATEGIES   = [
+    "Engineering Manager DevOps",
+    "Platform Engineering Manager",
+    "Technical Lead Platform",
+]
+LOCATIONS           = ["Bangalore", "Hyderabad", "Chennai"]
+RESULTS_PER_SEARCH  = 10
+HOURS_OLD           = 72
+TARGET_SITES        = ["indeed", "linkedin"]
+
+AI_SCORE_THRESHOLD  = 55        # Minimum Gemini score to notify
+AI_MAX_JOBS         = 10        # Cap AI calls per run to save quota
+AI_INTER_CALL_SLEEP = 15        # Seconds between Gemini calls (was 30 — halved)
+AI_RETRY_BASE_WAIT  = 20        # Base seconds for 429 backoff (multiplied by attempt)
+AI_RETRIES          = 3
+
+SEEN_JOBS_FILE      = Path("seen_jobs.json")    # Tracks URLs across runs
+RESULTS_LOG_FILE    = Path("matched_jobs.csv")  # Permanent log of all matches
+
+# ─────────────────────────────────────────────
+# 3. RESUME  (move personal details to .env as MY_RESUME for public repos)
+# ─────────────────────────────────────────────
+MY_RESUME = RESUME_TEXT or """
+NAME: [Your Name - set MY_RESUME env var or edit here]
+
+PROFESSIONAL SUMMARY
+Platform Engineering Manager with 16+ years of experience transforming legacy operations
+into high-performance, AI-driven DevOps cultures. Currently leading a 7-member engineering
+squad to build self-service Internal Developer Platforms (IDP) on Azure & AWS. Expert in
+FinOps governance (saving $200k+ annually) and leveraging Generative AI to automate
+workflows. Proven track record of scaling delivery for 50+ applications while cutting
+release cycles by 40%. Seeking a Senior Manager role to drive platform strategy and
+engineering excellence.
+
+CORE SKILLS
+Platform Strategy: Platform Engineering, IDP, SRE, FinOps, DevSecOps.
+Cloud & Infrastructure: Azure, AWS, Kubernetes (AKS/EKS), Docker, Helm, Terraform, Ansible.
+AI & Automation: Generative AI (ChatGPT/Claude), LLMOps, Python, Bash, Prompt Engineering.
+Leadership: Engineering Management (team of 7), Hiring, Appraisals, Agile/Scrum.
+
+EXPERIENCE
+Associate Manager – Platform Engineering & DevOps | Apr 2025 – Present
+- Manage squad of 7 DevOps engineers; scaled from 5 to 7 members.
+- Led AI-First DevOps initiative; boosted team productivity by 20%.
+- FinOps: saved $200k+/year across 50+ Azure/AWS applications.
+- GitOps & self-service pipelines: cut release cycles by 40%.
+
+Technical Lead – DevOps & SRE | Sep 2022 – Mar 2025
+- Led pod of 6 engineers; CI/CD transformation for 30+ projects.
+- Terraform & GitHub Actions: cut provisioning time by 50%.
+- DevSecOps: SonarQube, Veracode, HashiCorp Vault — reduced vulnerabilities by 15%.
+
+Associate Technical Lead | Jan 2018 – Sep 2022
+- AKS/OpenShift migration for 40+ production workloads.
+- Classic → YAML/GitOps pipeline transition; cut deployment costs by 15%.
+
+Principal Software Engineer | Oct 2016 – Dec 2018
+- Azure DevOps & TFS pipeline modernization; reduced build times by 20%.
+
+Senior Software Engineer | Feb 2013 – Oct 2016
+- Jenkins automation; Git & TFS enterprise version control.
+
+EDUCATION
+Master of Science (Physics), Andhra University, 2004
+"""
+
+# ─────────────────────────────────────────────
+# 4. SEEN-JOBS DEDUPLICATION (persists across runs)
+# ─────────────────────────────────────────────
+def load_seen_jobs() -> set:
+    if SEEN_JOBS_FILE.exists():
+        try:
+            return set(json.loads(SEEN_JOBS_FILE.read_text()))
+        except Exception:
+            return set()
+    return set()
+
+def save_seen_jobs(seen: set):
+    SEEN_JOBS_FILE.write_text(json.dumps(list(seen), indent=2))
+
+# ─────────────────────────────────────────────
+# 5. RESULTS LOGGING (CSV — fallback if Telegram fails)
+# ─────────────────────────────────────────────
+def log_match_to_csv(title, location, score, url):
+    is_new = not RESULTS_LOG_FILE.exists()
+    with open(RESULTS_LOG_FILE, "a", newline="", encoding="utf-8") as f:
+        writer = csv.writer(f)
+        if is_new:
+            writer.writerow(["timestamp", "title", "location", "score", "url"])
+        writer.writerow([
+            datetime.datetime.now().strftime("%Y-%m-%d %H:%M"),
+            title, location, score, url
+        ])
+
+# ─────────────────────────────────────────────
+# 6. TELEGRAM NOTIFICATION
+# ─────────────────────────────────────────────
+def send_telegram_message(message: str) -> bool:
     url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
     data = urllib.parse.urlencode({
         'chat_id': TELEGRAM_CHAT_ID,
@@ -27,291 +135,303 @@ def send_telegram_message(message):
         'parse_mode': 'HTML',
         'disable_web_page_preview': False
     }).encode('utf-8')
-    
     try:
         req = urllib.request.Request(url, data=data, method='POST')
-        with urllib.request.urlopen(req) as response:
-            return True
+        with urllib.request.urlopen(req, timeout=10) as resp:
+            return resp.status == 200
     except Exception as e:
-        print(f"   (Telegram Error: {e})")
+        print(f"   ⚠️ Telegram error: {e}")
         return False
 
-# --- 3. SMART KEYWORD FILTER ---
-def keyword_prefilter(title, description):
-    title_lower = str(title).lower() if title else ""
-    desc_lower = str(description).lower() if description else ""
-    
-    # HARD EXCLUDE
-    exclude_in_title = [
-        'quality assurance', 'qa engineer', 'test engineer', 'sdet',
-        'data analyst', 'business analyst', 'sales', 'support engineer',
-        'junior', 'intern', 'entry level',
-        'network engineer', 'help desk', 'service desk',
-        'director', 'vp', 'vice president', 'head of', 'chief',
-        'distinguished', 'chemist', 'scientist', 'researcher', 'medical', 'pharma'
-    ]
-    
-    for exclude in exclude_in_title:
-        if exclude in title_lower:
-            return False, "Wrong level/role"
-    
-    # TARGET ROLES
-    perfect_titles = [
-        'engineering manager', 'platform manager', 'devops manager',
-        'sre manager', 'infrastructure manager', 'technical manager',
-        'engineering lead', 'technical lead', 'team lead', 'devops lead',
-        'manager, platform', 'manager, devops', 'manager, infrastructure',
-        'associate manager', 'delivery manager',
-        'software engineering manager', 'software manager',
-        'manager sw', 'sw engineering', 'manager 3', 'manager ii', 'manager iii'
-    ]
-    
-    for keyword in perfect_titles:
-        if keyword in title_lower:
-            return True, "Perfect title match"
-    
-    if len(desc_lower) < 100:
-        return False, "Need description to evaluate"
-    
-    # SKILLS
-    your_skills = [
-        'kubernetes', 'k8s', 'aks', 'eks', 'azure', 'aws', 'cloud',
-        'platform engineering', 'platform', 'internal developer platform', 'idp',
-        'terraform', 'infrastructure as code', 'iac', 'ansible', 'helm',
-        'finops', 'cost optimization', 'gitops', 'ci/cd', 'devops', 'sre',
-        'docker', 'container', 'team lead', 'engineering management', 'manage team',
-        'generative ai', 'llm', 'prompt engineering', 'python', 'bash'
-    ]
-    
-    skill_matches = sum(1 for skill in your_skills if skill in desc_lower)
-    
-    if skill_matches >= 2:
-        return True, f"Skill match ({skill_matches} skills)"
-    
-    if ('manager' in title_lower or 'lead' in title_lower) and skill_matches >= 1:
-        return True, "Leadership + tech skills"
-    
-    return False, "Not relevant"
+# ─────────────────────────────────────────────
+# 7. KEYWORD FILTER  (returns pass/fail + a priority score for sorting)
+# ─────────────────────────────────────────────
+EXCLUDE_TITLE_KEYWORDS = [
+    'quality assurance', 'qa engineer', 'test engineer', 'sdet',
+    'data analyst', 'business analyst', 'sales', 'support engineer',
+    'junior', 'intern', 'entry level',
+    'network engineer', 'help desk', 'service desk',
+    'director', 'vp', 'vice president', 'head of', 'chief',
+    'distinguished', 'chemist', 'scientist', 'researcher', 'medical', 'pharma',
+]
 
-# --- 4. AI FUNCTION (with retry logic) ---
-def ask_gemini_stealth(prompt, retries=3):
-    url = f"https://generativelanguage.googleapis.com/v1beta/models/gemini-2.0-flash:generateContent?key={GEMINI_API_KEY}"
+PERFECT_TITLE_KEYWORDS = [
+    'engineering manager', 'platform manager', 'devops manager',
+    'sre manager', 'infrastructure manager', 'technical manager',
+    'engineering lead', 'technical lead', 'team lead', 'devops lead',
+    'manager, platform', 'manager, devops', 'manager, infrastructure',
+    'associate manager', 'delivery manager',
+    'software engineering manager', 'software manager',
+    'manager sw', 'sw engineering', 'manager 3', 'manager ii', 'manager iii',
+]
+
+SKILL_KEYWORDS = [
+    'kubernetes', 'k8s', 'aks', 'eks', 'azure', 'aws', 'cloud',
+    'platform engineering', 'platform', 'internal developer platform', 'idp',
+    'terraform', 'infrastructure as code', 'iac', 'ansible', 'helm',
+    'finops', 'cost optimization', 'gitops', 'ci/cd', 'devops', 'sre',
+    'docker', 'container', 'team lead', 'engineering management', 'manage team',
+    'generative ai', 'llm', 'prompt engineering', 'python', 'bash',
+]
+
+def keyword_prefilter(title, description) -> tuple[bool, str, int]:
+    """Returns (is_match, reason, priority_score).
+    Higher priority_score = analyzed first by AI.
+    """
+    title_lower = str(title).lower() if title else ""
+    desc_lower  = str(description).lower() if description else ""
+
+    # Hard exclude
+    for kw in EXCLUDE_TITLE_KEYWORDS:
+        if kw in title_lower:
+            return False, f"Excluded: '{kw}' in title", 0
+
+    # Perfect title match — highest priority
+    for kw in PERFECT_TITLE_KEYWORDS:
+        if kw in title_lower:
+            skill_matches = sum(1 for s in SKILL_KEYWORDS if s in desc_lower)
+            priority = 100 + skill_matches  # bump further if skills also present
+            return True, f"Perfect title match (+{skill_matches} skills)", priority
+
+    if len(desc_lower) < 100:
+        return False, "Description too short to evaluate", 0
+
+    # Skill matching in description
+    skill_matches = sum(1 for s in SKILL_KEYWORDS if s in desc_lower)
+
+    if skill_matches >= 2:
+        has_leadership = ('manager' in title_lower or 'lead' in title_lower)
+        priority = 50 + skill_matches + (20 if has_leadership else 0)
+        return True, f"Skill match ({skill_matches} skills)", priority
+
+    if ('manager' in title_lower or 'lead' in title_lower) and skill_matches >= 1:
+        return True, "Leadership + tech skill", 30 + skill_matches
+
+    return False, "Not relevant", 0
+
+# ─────────────────────────────────────────────
+# 8. GEMINI AI — with proper retry logic
+# ─────────────────────────────────────────────
+def ask_gemini(prompt: str) -> str:
+    """Calls Gemini with exponential-ish backoff on 429. Retries all error types."""
+    url = (
+        "https://generativelanguage.googleapis.com/v1beta/models/"
+        f"gemini-2.0-flash:generateContent?key={GEMINI_API_KEY}"
+    )
     headers = {'Content-Type': 'application/json'}
     data = json.dumps({"contents": [{"parts": [{"text": prompt}]}]}).encode('utf-8')
 
-    for attempt in range(retries):
+    for attempt in range(1, AI_RETRIES + 1):
         try:
             req = urllib.request.Request(url, data=data, headers=headers, method='POST')
-            with urllib.request.urlopen(req) as response:
-                result = json.loads(response.read().decode())
+            with urllib.request.urlopen(req, timeout=30) as resp:
+                result = json.loads(resp.read().decode())
                 return result['candidates'][0]['content']['parts'][0]['text']
+
         except urllib.error.HTTPError as e:
             if e.code == 429:
-                wait = (attempt + 1) * 30  # 30s, 60s, 90s
-                print(f"   (Rate limited, waiting {wait}s before retry {attempt + 1}/{retries})...", end="")
+                wait = AI_RETRY_BASE_WAIT * attempt
+                print(f" [Rate limited — waiting {wait}s, attempt {attempt}/{AI_RETRIES}]", end="", flush=True)
                 time.sleep(wait)
             else:
-                print(f"   (AI Error: HTTP {e.code})", end="")
-                return "0"
-        except Exception as e:
-            print(f"   (AI Error: {e})", end="")
-            return "0"
+                print(f" [HTTP {e.code} — retrying {attempt}/{AI_RETRIES}]", end="", flush=True)
+                time.sleep(5 * attempt)
 
-    print(f"   (AI Error: Failed after {retries} retries)", end="")
+        except Exception as e:
+            print(f" [Error: {e} — retrying {attempt}/{AI_RETRIES}]", end="", flush=True)
+            time.sleep(5 * attempt)
+
+    print(f" [Failed after {AI_RETRIES} retries]", end="")
     return "0"
 
-# --- 5. CONFIGURATION ---
-SEARCH_STRATEGIES = ["Engineering Manager DevOps", "Platform Engineering Manager", "Technical Lead Platform"]
-LOCATIONS = ["Bangalore", "Hyderabad", "Chennai"]
-RESULTS_PER_SEARCH = 10
-HOURS_OLD = 72
-TARGET_SITES = ["indeed", "linkedin"]
+def parse_score(raw: str) -> int:
+    """Safely extract the FIRST integer from Gemini's response."""
+    match = re.search(r'\b(\d{1,3})\b', raw)
+    if match:
+        val = int(match.group(1))
+        return max(0, min(val, 100))   # Clamp to 0–100
+    return 0
 
-MY_RESUME = """
-Shaik Noor Ahamed
-📍 Bengaluru, India | 📞 +91-8123532127 | ✉️ ahamed338@gmail.com | 🔗 linkedin.com/in/ahamed-shaik-9ba020191
-
-PROFESSIONAL SUMMARY
-Platform Engineering Manager with 16+ years of experience transforming legacy operations into high-performance, AI-driven DevOps cultures. Currently leading a 7-member engineering squad to build self-service Internal Developer Platforms (IDP) on Azure & AWS. Expert in FinOps governance (saving $200k+ annually) and leveraging Generative AI to automate workflows. Proven track record of scaling delivery for 50+ applications while cutting release cycles by 40%. Seeking a Senior Manager role to drive platform strategy and engineering excellence.
-
-CORE SKILLS
-Platform Strategy: Platform Engineering, Internal Developer Platform (IDP), Site Reliability Engineering (SRE), FinOps (Cloud Cost Optimization), DevSecOps.
-Cloud & Infrastructure: Azure, AWS, Kubernetes (AKS/EKS), Docker, Helm, Terraform (IaC), Ansible.
-AI & Automation: Generative AI Integration (ChatGPT/Claude), LLM Ops, Python, Bash, Prompt Engineering.
-Leadership: Engineering Management (Team of 7), Performance Reviews, Tech Hiring, Agile/Scrum Delivery, Stakeholder Management.
-
-PROFESSIONAL EXPERIENCE
-First American (India) Pvt. Ltd. | Bengaluru, India
-Associate Manager – Platform Engineering & DevOps (Functionally: Engineering Manager)
-Apr 2025 – Present
-* Engineering Leadership: Manage a high-performing squad of 7 DevOps Engineers, handling hiring, performance appraisals, and career coaching. Scaled team from 5 to 7 members to support enterprise platform growth.
-* GenAI Innovation: Pioneered the "AI-First" DevOps initiative, training the team on Prompt Engineering and integrating ChatGPT/Claude to automate documentation and troubleshooting, boosting team productivity by 20%.
-* FinOps & Cost Strategy: Spearheaded multi-cloud (Azure/AWS) cost optimization for 50+ applications, achieving $200k+ in annual savings (20% reduction) through rightsizing and automated governance.
-* Platform Transformation: Directed the transition to GitOps and self-service pipelines, successfully slashing release cycles by 40% and increasing Agile sprint velocity by 18%.
-
-Technical Lead – DevOps & SRE
-Sep 2022 – Mar 2025
-* Team Leadership: Led a pod of 6 engineers, driving the CI/CD transformation for 30+ critical projects while acting as the de-facto delivery lead.
-* Infrastructure as Code: Architected scalable Terraform & GitHub Actions pipelines, reducing environment provisioning time by 50%.
-* Security (DevSecOps): Integrated SonarQube, Veracode, and HashiCorp Vault into the release path, reducing production vulnerabilities by 15%.
-
-Associate Technical Lead | Jan 2018 – Sep 2022
-Coordinated team of 4-5 engineers through AKS and OpenShift migration for 40+ production workloads
-Led daily standups, sprint planning, and delivery coordination while managing cross-team dependencies
-Migrated legacy applications to Kubernetes, improving scalability by 30% and reducing infrastructure overhead
-Transitioned pipelines from Classic → YAML/GitOps, reducing deployment costs by 15%.
-
-Principal Software Engineer | Oct 2016 – Dec 2018
-Modernized release pipelines in Azure DevOps & TFS, reducing build times by 20%.
-Enabled automated testing frameworks, lowering production defects by 10%.
-
-SLK Software Services Pvt. Ltd. | Bengaluru, India
-Senior Software Engineer | Feb 2013 – Oct 2016
-Automated build & deployment processes using Jenkins, improving release speed.
-Managed Git & TFS version control for enterprise-scale applications.
-
-Patra India Pvt. Ltd. | Hyderabad, India
-Application Support Engineer | Aug 2007 – Nov 2012
-Delivered 99% uptime in production environments through proactive monitoring.
-Improved SLA adherence with automation scripts (Bash/PowerShell).
-
-KEY PROJECTS & IMPACT
-Cloud Migration: Migrated legacy apps to AKS/OpenShift, cutting deployment time by 20%.
-CI/CD Optimization: Implemented YAML & GitOps pipelines, reducing new project setup time by 30%.
-Cost Savings: Applied FinOps & automation strategies, saving 25% in infrastructure costs.
-DevSecOps: Integrated Vault, SonarQube, Veracode, strengthening cloud security posture.
-Tool Modernization: Transitioned from TFS → Azure DevOps, cutting tool maintenance cost by 20%.
-
-EDUCATION
-Master of Science (Physics), Andhra University, 2004
-"""
-
-# --- 6. MAIN FUNCTION ---
+# ─────────────────────────────────────────────
+# 9. MAIN
+# ─────────────────────────────────────────────
 def start_hunting():
-    print(f"🔌 Testing Connections...")
+    print("=" * 60)
+    print(f"🚀 Job Hunter  |  {datetime.datetime.now().strftime('%Y-%m-%d %H:%M')}")
+    print("=" * 60)
 
-    # Test Gemini — warn but don't kill the pipeline on transient rate limits
-    print(f"   - Gemini AI...", end="")
-    test = ask_gemini_stealth("Reply with the word OK and nothing else.")
-    if "OK" not in test.upper():
-        print(f" ⚠️ (Gemini test inconclusive, will retry per-job — continuing anyway)")
-    else:
-        print(" ✅")
+    # ── Connection tests ──────────────────────
+    print("\n🔌 Testing connections...")
 
-    # Test Telegram
-    print(f"   - Telegram...", end="")
-    if send_telegram_message("🤖 Job Hunter Started!"):
+    print("   - Gemini AI...", end="", flush=True)
+    test_response = ask_gemini("Reply with the single word OK and nothing else.")
+    if "OK" in test_response.upper():
         print(" ✅")
     else:
-        print(" ⚠️ (Optional — check TELEGRAM secrets)")
+        print(f" ⚠️  (Got: '{test_response[:40]}' — will retry per job)")
 
-    all_jobs = []
-    for location in LOCATIONS:
+    print("   - Telegram...", end="", flush=True)
+    tg_ok = send_telegram_message("🤖 <b>Job Hunter started!</b>")
+    print(" ✅" if tg_ok else " ⚠️  (Check TELEGRAM_BOT_TOKEN / TELEGRAM_CHAT_ID)")
+
+    # ── Load seen jobs ────────────────────────
+    seen_jobs = load_seen_jobs()
+    print(f"\n📋 Previously seen jobs: {len(seen_jobs)}")
+
+    # ── Scraping ──────────────────────────────
+    all_frames = []
+    for search_location in LOCATIONS:
         for search_term in SEARCH_STRATEGIES:
-            print(f"\n🕵️‍♂️ Scraping: '{search_term}' in {location}...")
+            print(f"\n🕵️  Scraping: '{search_term}' in {search_location}...", flush=True)
             try:
-                time.sleep(2)
-                jobs = scrape_jobs(
+                time.sleep(2)  # polite delay between scrapes
+                jobs_df = scrape_jobs(
                     site_name=TARGET_SITES,
                     search_term=search_term,
-                    location=f"{location}, India",
+                    location=f"{search_location}, India",
                     results_wanted=RESULTS_PER_SEARCH,
                     hours_old=HOURS_OLD,
-                    country_indeed='India'
+                    country_indeed='India',
                 )
-                print(f"   Found {len(jobs)} jobs")
-                all_jobs.append(jobs)
+                print(f"   Found {len(jobs_df)} jobs")
+                all_frames.append(jobs_df)
             except Exception as e:
-                print(f"   ⚠️ Error scraping '{search_term}' in {location}: {e}")
+                print(f"   ⚠️  Scrape error: {e}")
                 continue
 
-    if not all_jobs:
-        print("\n❌ No jobs found from any source.")
+    if not all_frames:
+        msg = "❌ No jobs scraped from any source."
+        print(f"\n{msg}")
+        send_telegram_message(f"🤖 {msg}")
         return
 
-    jobs = pd.concat(all_jobs, ignore_index=True)
+    # ── Deduplicate scraped results ───────────
+    jobs = pd.concat(all_frames, ignore_index=True)
     jobs = jobs.drop_duplicates(subset=['job_url'], keep='first')
-    print(f"\n✅ Total unique jobs found: {len(jobs)}")
+    print(f"\n✅ Total unique jobs scraped: {len(jobs)}")
 
-    # Phase 1: Keyword Filtering
-    print(f"\n🔍 PHASE 1: Keyword Filtering...")
-    promising_jobs = []
-    for index, job in jobs.iterrows():
-        title = job.get('title', 'Unknown')
-        raw_desc = job.get('description')
-        description = str(raw_desc) if raw_desc else ""
+    # Filter out already-seen URLs
+    new_jobs = jobs[~jobs['job_url'].isin(seen_jobs)].copy()
+    skipped = len(jobs) - len(new_jobs)
+    print(f"   Skipping {skipped} already-seen jobs → {len(new_jobs)} new to evaluate")
 
-        is_match, reason = keyword_prefilter(title, description)
-
-        if is_match:
-            promising_jobs.append(job)
-            print(f"   ✅ {str(title)[:50]} — {reason}")
-
-    if not promising_jobs:
-        print("\n❌ No promising jobs after keyword filter.")
-        send_telegram_message("🤖 Job Hunter finished — no promising jobs found today.")
+    if new_jobs.empty:
+        msg = "🤖 Job Hunter finished — no new jobs since last run."
+        print(f"\n{msg}")
+        send_telegram_message(msg)
         return
 
-    print(f"\n🎯 {len(promising_jobs)} jobs passed the keyword filter.")
+    # ── Phase 1: Keyword filter ───────────────
+    print(f"\n🔍 PHASE 1: Keyword Filtering ({len(new_jobs)} jobs)...")
+    promising = []
+    for _, job in new_jobs.iterrows():
+        title = job.get('title', 'Unknown')
+        desc  = str(job.get('description', '') or '')
+        is_match, reason, priority = keyword_prefilter(title, desc)
+        if is_match:
+            promising.append((priority, job, reason))
+            print(f"   ✅ [{priority:>3}] {str(title)[:55]} — {reason}")
 
-    # Phase 2: AI Scoring
-    print(f"\n🤖 PHASE 2: AI Analysis on {len(promising_jobs)} promising jobs...")
+    if not promising:
+        msg = "🤖 Job Hunter finished — no promising jobs after keyword filter."
+        print(f"\n❌ {msg}")
+        send_telegram_message(msg)
+        # Still mark all new jobs as seen so we don't re-evaluate them
+        seen_jobs.update(new_jobs['job_url'].tolist())
+        save_seen_jobs(seen_jobs)
+        return
+
+    # Sort by priority score (highest first) so best candidates use AI quota
+    promising.sort(key=lambda x: x[0], reverse=True)
+    print(f"\n🎯 {len(promising)} jobs passed keyword filter (sorted by priority)")
+
+    # ── Phase 2: AI Scoring ───────────────────
+    to_analyze = promising[:AI_MAX_JOBS]
+    print(f"\n🤖 PHASE 2: AI Analysis on top {len(to_analyze)} jobs (cap={AI_MAX_JOBS})...")
 
     matched_count = 0
-    for i, job in enumerate(promising_jobs):
-        if i >= 10:
-            break  # Cap AI calls to avoid burning quota
+    analyzed_urls = []
 
-        title = job.get('title', 'Unknown')
-        location = job.get('location', 'Unknown')
-        apply_url = job.get('job_url', '#')
+    for i, (priority, job, kw_reason) in enumerate(to_analyze, 1):
+        job_title    = job.get('title', 'Unknown')
+        job_location = job.get('location', 'Unknown')
+        job_url      = job.get('job_url', '#')
+        job_company  = job.get('company', 'Unknown')
 
-        raw_desc = job.get('description')
-        description = str(raw_desc)
-        if not raw_desc or description.lower() == 'nan':
-            description = "No description available for this job."
+        raw_desc = job.get('description', '')
+        desc = str(raw_desc) if raw_desc and str(raw_desc).lower() != 'nan' else "No description available."
+        desc_truncated = desc[:2000]  # slightly more context than before
 
-        desc_truncated = description[:1500]
+        print(f"\n   [{i}/{len(to_analyze)}] {str(job_title)[:50]}", end="", flush=True)
+        print(f"\n   🏢 {job_company} | 📍 {job_location}", flush=True)
 
-        print(f"\n   [{i+1}] Analyzing: {str(title)[:40]}...", end="")
+        prompt = f"""You are a recruiter evaluating a candidate.
+Score how well this job matches the candidate's resume on a scale of 0 to 100.
+Consider: seniority level, required tech stack, leadership expectations, location.
+Output ONLY a single integer between 0 and 100. No explanation, no text, just the number.
 
-        prompt = f"""
-        Score how well this job matches the resume on a scale of 0 to 100.
-        Output ONLY a single integer number, nothing else.
+CANDIDATE RESUME:
+{MY_RESUME}
 
-        RESUME:
-        {MY_RESUME}
+JOB TITLE: {job_title}
+COMPANY: {job_company}
+LOCATION: {job_location}
+JOB DESCRIPTION:
+{desc_truncated}
+"""
+        print(f"   🤖 Scoring...", end="", flush=True)
+        raw_score = ask_gemini(prompt)
+        score = parse_score(raw_score)
+        print(f" {score}%")
 
-        JOB TITLE: {title}
-        LOCATION: {location}
-        JOB DESCRIPTION:
-        {desc_truncated}
-        """
+        analyzed_urls.append(job_url)
 
-        score_text = ask_gemini_stealth(prompt)
-        time.sleep(30)  # Generous delay to avoid 429s during the job loop
-
-        try:
-            score = int(''.join(filter(str.isdigit, score_text)))
-        except:
-            score = 0
-
-        print(f" Score: {score}%")
-
-        if score >= 55:
+        if score >= AI_SCORE_THRESHOLD:
             matched_count += 1
-            message = (
-                f"🎯 <b>MATCH: {score}%</b>\n\n"
-                f"<b>{title}</b>\n"
-                f"📍 {location}\n\n"
-                f"<a href='{apply_url}'>👉 APPLY NOW</a>"
-            )
-            send_telegram_message(message)
+            log_match_to_csv(job_title, job_location, score, job_url)
 
-    summary = f"🤖 Job Hunter done! Analyzed {min(len(promising_jobs), 10)} jobs. Found {matched_count} matches (≥55%)."
-    print(f"\n{summary}")
+            bar = "🟩" * (score // 10) + "⬜" * (10 - score // 10)
+            message = (
+                f"🎯 <b>MATCH FOUND! Score: {score}%</b>\n"
+                f"{bar}\n\n"
+                f"<b>{job_title}</b>\n"
+                f"🏢 {job_company}\n"
+                f"📍 {job_location}\n"
+                f"🔑 Filter: {kw_reason}\n\n"
+                f"<a href='{job_url}'>👉 APPLY NOW</a>"
+            )
+            tg_sent = send_telegram_message(message)
+            if not tg_sent:
+                print(f"   ⚠️  Telegram failed — match saved to {RESULTS_LOG_FILE}")
+
+        # Polite delay between AI calls
+        if i < len(to_analyze):
+            time.sleep(AI_INTER_CALL_SLEEP)
+
+    # ── Mark all new jobs as seen ─────────────
+    # Only mark jobs we've actually evaluated (or filtered) to avoid missing
+    # good jobs that were beyond the AI cap
+    all_evaluated_urls = [job.get('job_url', '') for _, job, _ in promising]
+    seen_jobs.update(all_evaluated_urls)
+    save_seen_jobs(seen_jobs)
+    print(f"\n💾 Updated seen_jobs.json ({len(seen_jobs)} total URLs tracked)")
+
+    # ── Summary ───────────────────────────────
+    summary = (
+        f"🤖 <b>Job Hunt Complete!</b>\n\n"
+        f"📊 Scraped: {len(jobs)} jobs\n"
+        f"🆕 New this run: {len(new_jobs)}\n"
+        f"🔍 Passed keyword filter: {len(promising)}\n"
+        f"🤖 AI analyzed: {len(to_analyze)}\n"
+        f"🎯 Matches (≥{AI_SCORE_THRESHOLD}%): {matched_count}\n\n"
+        f"📁 Full log: matched_jobs.csv"
+    )
+    print(f"\n{'='*60}")
+    print(summary.replace('<b>', '').replace('</b>', ''))
+    print('='*60)
     send_telegram_message(summary)
 
 
+# ─────────────────────────────────────────────
 if __name__ == "__main__":
     start_hunting()
