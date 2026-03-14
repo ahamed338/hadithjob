@@ -68,7 +68,7 @@ def get_random_hadith(max_attempts=20):
             hadith_text = hadith_text[:MAX_BODY_LENGTH].rsplit(' ', 1)[0] + "..."
 
         print(f"  Got hadith {hadith_number} from {collection['name']} book {book_num}")
-        return f"📖 *Daily Hadith* (Sahih)\n\n{hadith_text}\n\n_{reference}_"
+        return f"📖 <b>Daily Hadith</b> (Sahih)\n\n{hadith_text}\n\n<i>{reference}</i>"
 
     return None
 
@@ -95,7 +95,7 @@ def send_hadith_to_user():
         payload = {
             'chat_id':    chat_id,
             'text':       hadith,
-            'parse_mode': 'Markdown',
+            'parse_mode': 'HTML',
         }
         response = requests.post(url, json=payload, timeout=15)
         if response.status_code == 200:
