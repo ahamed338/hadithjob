@@ -21,14 +21,13 @@ GEMINI_API_KEY      = os.getenv("GEMINI_API_KEY")
 TELEGRAM_BOT_TOKEN  = os.getenv("TELEGRAM_BOT_TOKEN")
 TELEGRAM_CHAT_ID    = os.getenv("TELEGRAM_CHAT_ID")
 
-# Resume loaded from env (recommended) or falls back to MY_RESUME below
 RESUME_TEXT = os.getenv("MY_RESUME", None)
 
 if not GEMINI_API_KEY or not TELEGRAM_BOT_TOKEN:
     raise ValueError("Missing API Keys! Set GEMINI_API_KEY and TELEGRAM_BOT_TOKEN in .env or GitHub Secrets.")
 
 # ─────────────────────────────────────────────
-# 2. CONFIGURATION  (tweak here, not in code)
+# 2. CONFIGURATION
 # ─────────────────────────────────────────────
 SEARCH_STRATEGIES   = [
     "Engineering Manager DevOps",
@@ -40,17 +39,17 @@ RESULTS_PER_SEARCH  = 10
 HOURS_OLD           = 72
 TARGET_SITES        = ["indeed", "linkedin"]
 
-AI_SCORE_THRESHOLD  = 55        # Minimum Gemini score to notify
-AI_MAX_JOBS         = 10        # Cap AI calls per run to save quota
-AI_INTER_CALL_SLEEP = 15        # Seconds between Gemini calls (was 30 — halved)
-AI_RETRY_BASE_WAIT  = 20        # Base seconds for 429 backoff (multiplied by attempt)
+AI_SCORE_THRESHOLD  = 45        # ✅ FIX: Lowered from 55 → 45 (Gemini scores conservatively)
+AI_MAX_JOBS         = 10
+AI_INTER_CALL_SLEEP = 15
+AI_RETRY_BASE_WAIT  = 20
 AI_RETRIES          = 3
 
-SEEN_JOBS_FILE      = Path("seen_jobs.json")    # Tracks URLs across runs
-RESULTS_LOG_FILE    = Path("matched_jobs.csv")  # Permanent log of all matches
+SEEN_JOBS_FILE      = Path("seen_jobs.json")
+RESULTS_LOG_FILE    = Path("matched_jobs.csv")
 
 # ─────────────────────────────────────────────
-# 3. RESUME  (move personal details to .env as MY_RESUME for public repos)
+# 3. RESUME
 # ─────────────────────────────────────────────
 MY_RESUME = RESUME_TEXT or """
 NAME: [Your Name - set MY_RESUME env var or edit here]
@@ -97,7 +96,7 @@ Master of Science (Physics), Andhra University, 2004
 """
 
 # ─────────────────────────────────────────────
-# 4. SEEN-JOBS DEDUPLICATION (persists across runs)
+# 4. SEEN-JOBS DEDUPLICATION
 # ─────────────────────────────────────────────
 def load_seen_jobs() -> set:
     if SEEN_JOBS_FILE.exists():
@@ -111,7 +110,7 @@ def save_seen_jobs(seen: set):
     SEEN_JOBS_FILE.write_text(json.dumps(list(seen), indent=2))
 
 # ─────────────────────────────────────────────
-# 5. RESULTS LOGGING (CSV — fallback if Telegram fails)
+# 5. RESULTS LOGGING
 # ─────────────────────────────────────────────
 def log_match_to_csv(title, location, score, url):
     is_new = not RESULTS_LOG_FILE.exists()
@@ -144,7 +143,7 @@ def send_telegram_message(message: str) -> bool:
         return False
 
 # ─────────────────────────────────────────────
-# 7. KEYWORD FILTER  (returns pass/fail + a priority score for sorting)
+# 7. KEYWORD FILTER
 # ─────────────────────────────────────────────
 EXCLUDE_TITLE_KEYWORDS = [
     'quality assurance', 'qa engineer', 'test engineer', 'sdet',
@@ -175,28 +174,22 @@ SKILL_KEYWORDS = [
 ]
 
 def keyword_prefilter(title, description) -> tuple[bool, str, int]:
-    """Returns (is_match, reason, priority_score).
-    Higher priority_score = analyzed first by AI.
-    """
     title_lower = str(title).lower() if title else ""
     desc_lower  = str(description).lower() if description else ""
 
-    # Hard exclude
     for kw in EXCLUDE_TITLE_KEYWORDS:
         if kw in title_lower:
             return False, f"Excluded: '{kw}' in title", 0
 
-    # Perfect title match — highest priority
     for kw in PERFECT_TITLE_KEYWORDS:
         if kw in title_lower:
             skill_matches = sum(1 for s in SKILL_KEYWORDS if s in desc_lower)
-            priority = 100 + skill_matches  # bump further if skills also present
+            priority = 100 + skill_matches
             return True, f"Perfect title match (+{skill_matches} skills)", priority
 
     if len(desc_lower) < 100:
         return False, "Description too short to evaluate", 0
 
-    # Skill matching in description
     skill_matches = sum(1 for s in SKILL_KEYWORDS if s in desc_lower)
 
     if skill_matches >= 2:
@@ -210,10 +203,9 @@ def keyword_prefilter(title, description) -> tuple[bool, str, int]:
     return False, "Not relevant", 0
 
 # ─────────────────────────────────────────────
-# 8. GEMINI AI — with proper retry logic
+# 8. GEMINI AI — with retry logic
 # ─────────────────────────────────────────────
 def ask_gemini(prompt: str) -> str:
-    """Calls Gemini with exponential-ish backoff on 429. Retries all error types."""
     url = (
         "https://generativelanguage.googleapis.com/v1beta/models/"
         f"gemini-2.0-flash:generateContent?key={GEMINI_API_KEY}"
@@ -245,12 +237,48 @@ def ask_gemini(prompt: str) -> str:
     return "0"
 
 def parse_score(raw: str) -> int:
-    """Safely extract the FIRST integer from Gemini's response."""
     match = re.search(r'\b(\d{1,3})\b', raw)
     if match:
         val = int(match.group(1))
-        return max(0, min(val, 100))   # Clamp to 0–100
+        return max(0, min(val, 100))
     return 0
+
+# ─────────────────────────────────────────────
+# ✅ FIX: Rewritten scoring prompt with explicit rubric
+#    Old prompt asked Gemini to be a "recruiter" which
+#    made it rate conservatively and penalise location.
+#    New prompt gives a clear rubric and focuses only on
+#    skills + seniority — location is already handled by
+#    the scraper so we don't penalise for it here.
+# ─────────────────────────────────────────────
+def build_score_prompt(job_title, job_company, job_location, desc_truncated):
+    return f"""You are a helpful job-matching assistant. Your task is to score how well
+a candidate's profile matches a job posting, based ONLY on:
+  1. Technical skills overlap (cloud, DevOps, platform engineering tools)
+  2. Seniority and leadership level match
+  3. Domain/industry relevance
+
+DO NOT penalise for location — location fit is handled separately.
+DO NOT penalise for minor skill gaps if the overall profile is a strong fit.
+
+Use this rubric:
+  90–100 = Near-perfect match: seniority, skills, and domain all align tightly
+  70–89  = Strong match: most key skills present, seniority fits
+  50–69  = Decent match: some skills align, minor seniority or domain gaps
+  30–49  = Weak match: relevant background but significant gaps
+  0–29   = Poor match: different domain or seniority level entirely
+
+CANDIDATE PROFILE:
+{MY_RESUME}
+
+JOB TITLE: {job_title}
+COMPANY: {job_company}
+LOCATION: {job_location}
+JOB DESCRIPTION:
+{desc_truncated}
+
+Respond with ONLY a single integer between 0 and 100. No explanation. No text. Just the number.
+"""
 
 # ─────────────────────────────────────────────
 # 9. MAIN
@@ -260,7 +288,6 @@ def start_hunting():
     print(f"🚀 Job Hunter  |  {datetime.datetime.now().strftime('%Y-%m-%d %H:%M')}")
     print("=" * 60)
 
-    # ── Connection tests ──────────────────────
     print("\n🔌 Testing connections...")
 
     print("   - Gemini AI...", end="", flush=True)
@@ -274,17 +301,15 @@ def start_hunting():
     tg_ok = send_telegram_message("🤖 <b>Job Hunter started!</b>")
     print(" ✅" if tg_ok else " ⚠️  (Check TELEGRAM_BOT_TOKEN / TELEGRAM_CHAT_ID)")
 
-    # ── Load seen jobs ────────────────────────
     seen_jobs = load_seen_jobs()
     print(f"\n📋 Previously seen jobs: {len(seen_jobs)}")
 
-    # ── Scraping ──────────────────────────────
     all_frames = []
     for search_location in LOCATIONS:
         for search_term in SEARCH_STRATEGIES:
             print(f"\n🕵️  Scraping: '{search_term}' in {search_location}...", flush=True)
             try:
-                time.sleep(2)  # polite delay between scrapes
+                time.sleep(2)
                 jobs_df = scrape_jobs(
                     site_name=TARGET_SITES,
                     search_term=search_term,
@@ -305,12 +330,10 @@ def start_hunting():
         send_telegram_message(f"🤖 {msg}")
         return
 
-    # ── Deduplicate scraped results ───────────
     jobs = pd.concat(all_frames, ignore_index=True)
     jobs = jobs.drop_duplicates(subset=['job_url'], keep='first')
     print(f"\n✅ Total unique jobs scraped: {len(jobs)}")
 
-    # Filter out already-seen URLs
     new_jobs = jobs[~jobs['job_url'].isin(seen_jobs)].copy()
     skipped = len(jobs) - len(new_jobs)
     print(f"   Skipping {skipped} already-seen jobs → {len(new_jobs)} new to evaluate")
@@ -321,7 +344,6 @@ def start_hunting():
         send_telegram_message(msg)
         return
 
-    # ── Phase 1: Keyword filter ───────────────
     print(f"\n🔍 PHASE 1: Keyword Filtering ({len(new_jobs)} jobs)...")
     promising = []
     for _, job in new_jobs.iterrows():
@@ -336,21 +358,17 @@ def start_hunting():
         msg = "🤖 Job Hunter finished — no promising jobs after keyword filter."
         print(f"\n❌ {msg}")
         send_telegram_message(msg)
-        # Still mark all new jobs as seen so we don't re-evaluate them
         seen_jobs.update(new_jobs['job_url'].tolist())
         save_seen_jobs(seen_jobs)
         return
 
-    # Sort by priority score (highest first) so best candidates use AI quota
     promising.sort(key=lambda x: x[0], reverse=True)
     print(f"\n🎯 {len(promising)} jobs passed keyword filter (sorted by priority)")
 
-    # ── Phase 2: AI Scoring ───────────────────
     to_analyze = promising[:AI_MAX_JOBS]
     print(f"\n🤖 PHASE 2: AI Analysis on top {len(to_analyze)} jobs (cap={AI_MAX_JOBS})...")
 
     matched_count = 0
-    analyzed_urls = []
 
     for i, (priority, job, kw_reason) in enumerate(to_analyze, 1):
         job_title    = job.get('title', 'Unknown')
@@ -360,31 +378,23 @@ def start_hunting():
 
         raw_desc = job.get('description', '')
         desc = str(raw_desc) if raw_desc and str(raw_desc).lower() != 'nan' else "No description available."
-        desc_truncated = desc[:2000]  # slightly more context than before
+        desc_truncated = desc[:2000]
 
         print(f"\n   [{i}/{len(to_analyze)}] {str(job_title)[:50]}", end="", flush=True)
         print(f"\n   🏢 {job_company} | 📍 {job_location}", flush=True)
 
-        prompt = f"""You are a recruiter evaluating a candidate.
-Score how well this job matches the candidate's resume on a scale of 0 to 100.
-Consider: seniority level, required tech stack, leadership expectations, location.
-Output ONLY a single integer between 0 and 100. No explanation, no text, just the number.
+        # ✅ FIX: Use the new rubric-based prompt
+        prompt = build_score_prompt(job_title, job_company, job_location, desc_truncated)
 
-CANDIDATE RESUME:
-{MY_RESUME}
-
-JOB TITLE: {job_title}
-COMPANY: {job_company}
-LOCATION: {job_location}
-JOB DESCRIPTION:
-{desc_truncated}
-"""
         print(f"   🤖 Scoring...", end="", flush=True)
         raw_score = ask_gemini(prompt)
         score = parse_score(raw_score)
-        print(f" {score}%")
 
-        analyzed_urls.append(job_url)
+        # ✅ FIX: Warn if score looks unparseable (helps debug future issues)
+        if score == 0 and raw_score.strip() not in ("0", "00"):
+            print(f" ⚠️  (Could not parse score from: '{raw_score[:40]}')")
+        else:
+            print(f" {score}%")
 
         if score >= AI_SCORE_THRESHOLD:
             matched_count += 1
@@ -404,19 +414,14 @@ JOB DESCRIPTION:
             if not tg_sent:
                 print(f"   ⚠️  Telegram failed — match saved to {RESULTS_LOG_FILE}")
 
-        # Polite delay between AI calls
         if i < len(to_analyze):
             time.sleep(AI_INTER_CALL_SLEEP)
 
-    # ── Mark all new jobs as seen ─────────────
-    # Only mark jobs we've actually evaluated (or filtered) to avoid missing
-    # good jobs that were beyond the AI cap
     all_evaluated_urls = [job.get('job_url', '') for _, job, _ in promising]
     seen_jobs.update(all_evaluated_urls)
     save_seen_jobs(seen_jobs)
     print(f"\n💾 Updated seen_jobs.json ({len(seen_jobs)} total URLs tracked)")
 
-    # ── Summary ───────────────────────────────
     summary = (
         f"🤖 <b>Job Hunt Complete!</b>\n\n"
         f"📊 Scraped: {len(jobs)} jobs\n"
@@ -432,6 +437,5 @@ JOB DESCRIPTION:
     send_telegram_message(summary)
 
 
-# ─────────────────────────────────────────────
 if __name__ == "__main__":
     start_hunting()
