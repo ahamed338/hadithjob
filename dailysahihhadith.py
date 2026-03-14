@@ -33,47 +33,41 @@ def fetch_book(collection_key: str, book_num: int) -> list[dict]:
     ]
 
 
-def get_random_hadith(max_attempts=10):
+def get_random_hadith(max_attempts=20):
     """
-    Pick a collection at random, then keep drawing random books until one
-    yields valid hadiths.  Because books vary in size we do one extra draw:
-    accept the chosen hadith with probability len(book)/MAX_BOOK_SIZE
-    (rejection sampling) so larger books aren't under-represented.
+    Pick a random collection and book, accept the first book that contains
+    at least one valid hadith. No rejection sampling — the API's books are
+    too sparse for that to work reliably.
     """
-    # Rough upper bound on hadiths-per-book across both collections
-    MAX_BOOK_SIZE = 300
-
     for attempt in range(1, max_attempts + 1):
         print(f"Attempt {attempt}:")
         collection_key = random.choice(list(COLLECTIONS.keys()))
         collection = COLLECTIONS[collection_key]
         book_num = random.randint(1, collection['books'])
 
-        hadiths = fetch_book(collection_key, book_num)
-        if not hadiths:
-            print(f"  No valid hadiths in {collection['name']} book {book_num}, retrying...")
+        try:
+            hadiths = fetch_book(collection_key, book_num)
+        except Exception as e:
+            print(f"  Error fetching book: {e}, retrying...")
             continue
 
-        # Rejection sampling: accept proportional to book size so every
-        # hadith across all books has roughly equal probability of selection.
-        acceptance_prob = len(hadiths) / MAX_BOOK_SIZE
-        if random.random() > acceptance_prob:
-            print(f"  Book {book_num} rejected by sampler (size {len(hadiths)}), retrying...")
+        if not hadiths:
+            print(f"  No valid hadiths in {collection['name']} book {book_num}, retrying...")
             continue
 
         hadith = random.choice(hadiths)
         hadith_text = hadith['text'].strip()
         hadith_number = hadith.get('hadithnumber', 'Unknown')
 
-        # hadithnumber can come back as a float (e.g. 1234.0) — normalise it
         if isinstance(hadith_number, float) and hadith_number.is_integer():
             hadith_number = int(hadith_number)
 
-        reference = f"{collection['name']} – Book {book_num}, Hadith {hadith_number}"
+        reference = f"{collection['name']} - Book {book_num}, Hadith {hadith_number}"
 
         if len(hadith_text) > MAX_BODY_LENGTH:
-            hadith_text = hadith_text[:MAX_BODY_LENGTH].rsplit(' ', 1)[0] + "…"
+            hadith_text = hadith_text[:MAX_BODY_LENGTH].rsplit(' ', 1)[0] + "..."
 
+        print(f"  Got hadith {hadith_number} from {collection['name']} book {book_num}")
         return f"📖 *Daily Hadith* (Sahih)\n\n{hadith_text}\n\n_{reference}_"
 
     return None
